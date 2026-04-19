@@ -28,19 +28,6 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
-      - name: 缓存 Docker 镜像层
-        uses: actions/cache@v4
-        with:
-          path: /tmp/docker-cache
-          key: docker-sdk-${{ matrix.arch }}-openwrt-24.10
-          restore-keys: docker-sdk-${{ matrix.arch }}-
-
-      - name: 加载 Docker 缓存
-        run: |
-          if [ -f /tmp/docker-cache/sdk.tar ]; then
-            docker load < /tmp/docker-cache/sdk.tar
-          fi
-
       - name: 使用 OpenWrt SDK 编译
         uses: openwrt/gh-action-sdk@v5
         env:
@@ -49,11 +36,6 @@ jobs:
           PACKAGES: tieba-sign luci-app-tieba-sign
           NO_SHFMT_CHECK: 1
           EXTRA_FEEDS: src-git|luci|https://github.com/openwrt/luci.git src-git|tieba-sign|https://github.com/MichalPost/luci_tb.git
-
-      - name: 保存 Docker 镜像缓存
-        run: |
-          mkdir -p /tmp/docker-cache
-          docker save sdk -o /tmp/docker-cache/sdk.tar
 
       - name: 上传编译产物
         uses: actions/upload-artifact@v4
