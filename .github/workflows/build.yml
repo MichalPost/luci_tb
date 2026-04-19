@@ -12,6 +12,8 @@ jobs:
   build:
     name: Build ${{ matrix.arch }}
     runs-on: ubuntu-latest
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
     strategy:
       fail-fast: false
       matrix:
@@ -21,7 +23,7 @@ jobs:
 
     steps:
       - name: 拉取代码
-        uses: actions/checkout@v4.3.1
+        uses: actions/checkout@v5
         with:
           fetch-depth: 0
           persist-credentials: false
@@ -35,7 +37,6 @@ jobs:
           NO_SHFMT_CHECK: 1
           NO_DEFAULT_FEEDS: 1
           EXTRA_FEEDS: src-git luci https://github.com/openwrt/luci.git|src-git tieba-sign https://github.com/MichalPost/luci_tb.git
-          FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
       - name: 上传编译产物
         uses: actions/upload-artifact@v4
