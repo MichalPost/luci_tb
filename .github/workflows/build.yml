@@ -12,6 +12,8 @@ jobs:
   build:
     name: Build ${{ matrix.arch }}
     runs-on: ubuntu-latest
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
     strategy:
       fail-fast: false
       matrix:
@@ -39,6 +41,7 @@ jobs:
           FEEDNAME: tieba_sign
           PACKAGES: tieba-sign luci-app-tieba-sign system-manager-backend luci-app-system-manager
           NO_SHFMT_CHECK: 1
+          BUILD_LOG: 1
           V: s
 
       - name: 上传编译产物
@@ -46,6 +49,13 @@ jobs:
         with:
           name: ipk-${{ matrix.arch }}
           path: bin/packages/${{ matrix.arch }}/tieba_sign/*.ipk
+
+      - name: 上传编译日志
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs-${{ matrix.arch }}
+          path: logs/
 
   release:
     name: 发布 Release
