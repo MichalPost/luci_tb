@@ -35,7 +35,6 @@ jobs:
           FEEDNAME: tieba-sign
           PACKAGES: tieba-sign luci-app-tieba-sign
           NO_SHFMT_CHECK: 1
-          NO_DEFAULT_FEEDS: 1
           EXTRA_FEEDS: src-git|packages|https://github.com/openwrt/packages.git src-git|luci|https://github.com/openwrt/luci.git
 
       - name: 上传编译产物
