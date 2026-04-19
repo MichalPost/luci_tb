@@ -31,14 +31,14 @@ jobs:
       - name: 使用 OpenWrt SDK 编译
         uses: openwrt/gh-action-sdk@v5
         env:
-          ARCH: ${{ matrix.arch }}-openwrt-24.10
+          ARCH: ${{ matrix.arch }}-24.10.1
           FEEDNAME: tieba-sign
           PACKAGES: tieba-sign luci-app-tieba-sign
           NO_SHFMT_CHECK: 1
           EXTRA_FEEDS: src-git|luci|https://github.com/openwrt/luci.git src-git|tieba-sign|https://github.com/MichalPost/luci_tb.git
 
       - name: 上传编译产物
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: ipk-${{ matrix.arch }}
           path: bin/packages/${{ matrix.arch }}/tieba-sign/*.ipk
@@ -50,7 +50,7 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/v')
     steps:
       - name: 下载所有编译产物
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v5
         with:
           path: artifacts
 
