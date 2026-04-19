@@ -1,0 +1,20 @@
+{
+  "luci-app-system-manager": {
+    "description": "LuCI System Manager access",
+    "read": {
+      "ubus": {
+        "sm-files":    ["file_list", "file_read", "file_stat"],
+        "sm-usb":      ["usb_list"],
+        "sm-packages": ["pkg_installed", "pkg_available"],
+        "sm-cron":     ["cron_read"]
+      }
+    },
+    "write": {
+      "ubus": {
+        "sm-files":    ["file_write", "file_delete"],
+        "sm-packages": ["pkg_install", "pkg_remove"],
+        "sm-cron":     ["cron_write"]
+      }
+    }
+  }
+}

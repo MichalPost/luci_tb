@@ -1,0 +1,60 @@
+#!/usr/bin/env node
+'use strict';
+
+const { rpcdMain } = require('./sm-common.js');
+const { spawnSync } = require('child_process');
+const fs = require('fs');
+
+function list() {
+  return {
+    "cron_read": {},
+    "cron_write": { "entries": "array" },
+  };
+}
+
+function cron_read() {
+  // OpenWrt/busybox stores root crontab at /etc/crontabs/root
+  var content = '';
+  try {
+    content = fs.readFileSync('/etc/crontabs/root', 'utf8');
+  } catch (e) {
+    // fallback: try crontab -l
+    var r = spawnSync('crontab', ['-l', '-u', 'root'], { encoding: 'utf8' });
+    content = r.stdout || '';
+  }
+  var entries = content.split('\n')
+    .filter(function(l) { return l.trim() && !l.startsWith('#'); })
+    .map(function(line, i) {
+      var parts = line.trim().split(/\s+/);
+      var expr    = parts.slice(0, 5).join(' ');
+      var command = parts.slice(5).join(' ');
+      return { expr: expr, command: command, index: i };
+    });
+  return { entries: entries };
+}
+
+function cron_write(params) {
+  var entries = params.entries || [];
+  var content = entries.map(function(e) { return e.expr + ' ' + e.command; }).join('\n') + '\n';
+  // Write directly to /etc/crontabs/root (OpenWrt standard location)
+  try {
+    fs.mkdirSync('/etc/crontabs', { recursive: true });
+  } catch (e) { /* already exists */ }
+  fs.writeFileSync('/etc/crontabs/root', content, 'utf8');
+  // Reload crond
+  spawnSync('/etc/init.d/cron', ['reload'], { encoding: 'utf8' });
+  return { result: 'ok' };
+}
+
+rpcdMain(list, (method, params) => {
+  const methods = { cron_read, cron_write };
+  const methodFn = methods[method];
+  if (!methodFn) {
+    return { result: 'error', error: 'Unknown method: ' + method };
+  }
+  try {
+    return methodFn(params);
+  } catch (err) {
+    return { result: 'error', error: err.code || err.message || String(err) };
+  }
+});

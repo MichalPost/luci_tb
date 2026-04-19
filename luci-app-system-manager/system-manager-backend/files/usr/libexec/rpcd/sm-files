@@ -1,0 +1,78 @@
+#!/usr/bin/env node
+'use strict';
+
+const { validatePath, out, readStdin, rpcdMain } = require('./sm-common.js');
+const fs = require('fs');
+const path = require('path');
+
+function list() {
+  return {
+    "file_list":   { "path": "string" },
+    "file_read":   { "path": "string" },
+    "file_write":  { "path": "string", "content": "string" },
+    "file_delete": { "path": "string" },
+    "file_stat":   { "path": "string" },
+  };
+}
+
+function file_list(params) {
+  const safePath = validatePath(params.path);
+  const entries = fs.readdirSync(safePath).map(name => {
+    const full = path.join(safePath, name);
+    const st = fs.statSync(full);
+    return {
+      name,
+      path: full,
+      type: st.isDirectory() ? 'dir' : 'file',
+      size: st.size,
+      mtime: Math.floor(st.mtimeMs / 1000),
+      mode: (st.mode & 0o777).toString(8).padStart(4, '0'),
+    };
+  });
+  return { entries };
+}
+
+function file_read(params) {
+  const safePath = validatePath(params.path);
+  const content = fs.readFileSync(safePath, 'utf8');
+  return { content };
+}
+
+function file_write(params) {
+  const safePath = validatePath(params.path);
+  fs.writeFileSync(safePath, params.content, 'utf8');
+  return { result: 'ok' };
+}
+
+function file_delete(params) {
+  const safePath = validatePath(params.path);
+  fs.rmSync(safePath, { recursive: true, force: true });
+  return { result: 'ok' };
+}
+
+function file_stat(params) {
+  const safePath = validatePath(params.path);
+  const st = fs.statSync(safePath);
+  const name = path.basename(safePath);
+  return {
+    name,
+    path: safePath,
+    type: st.isDirectory() ? 'dir' : 'file',
+    size: st.size,
+    mtime: Math.floor(st.mtimeMs / 1000),
+    mode: (st.mode & 0o777).toString(8).padStart(4, '0'),
+  };
+}
+
+rpcdMain(list, (method, params) => {
+  const methods = { file_list, file_read, file_write, file_delete, file_stat };
+  const methodFn = methods[method];
+  if (!methodFn) {
+    return { result: 'error', error: 'Unknown method: ' + method };
+  }
+  try {
+    return methodFn(params);
+  } catch (err) {
+    return { result: 'error', error: err.code || err.message || String(err) };
+  }
+});
