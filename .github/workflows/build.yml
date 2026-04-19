@@ -37,7 +37,7 @@ jobs:
         env:
           ARCH: ${{ matrix.arch }}-openwrt-24.10
           FEEDNAME: tieba_sign
-          PACKAGES: tieba-sign luci-app-tieba-sign
+          PACKAGES: tieba-sign luci-app-tieba-sign system-manager-backend luci-app-system-manager
           NO_SHFMT_CHECK: 1
           V: s
 
