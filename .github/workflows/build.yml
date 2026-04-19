@@ -21,9 +21,10 @@ jobs:
 
     steps:
       - name: 拉取代码
-        uses: actions/checkout@v4
+        uses: actions/checkout@v4.3.1
         with:
           fetch-depth: 0
+          persist-credentials: false
 
       - name: 使用 OpenWrt SDK 编译
         uses: openwrt/gh-action-sdk@v5
@@ -33,6 +34,7 @@ jobs:
           PACKAGES: tieba-sign luci-app-tieba-sign
           NO_SHFMT_CHECK: 1
           EXTRA_FEEDS: src-git tieba-sign https://github.com/MichalPost/luci_tb.git
+          FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
       - name: 上传编译产物
         uses: actions/upload-artifact@v4
