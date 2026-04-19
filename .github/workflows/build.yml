@@ -29,7 +29,9 @@ jobs:
           persist-credentials: false
 
       - name: 使用 OpenWrt SDK 编译
-        uses: openwrt/gh-action-sdk@v5
+        # v7+ runs setup.sh when present; OpenWrt 24.10 SDK images ship setup.sh
+        # instead of a pre-extracted tree, so v5 fails with missing feeds.conf.default.
+        uses: openwrt/gh-action-sdk@v10
         env:
           ARCH: ${{ matrix.arch }}-openwrt-24.10
           FEEDNAME: tieba-sign
