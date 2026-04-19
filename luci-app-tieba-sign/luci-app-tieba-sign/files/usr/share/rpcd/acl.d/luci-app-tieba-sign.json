@@ -1,0 +1,24 @@
+{
+    "luci-app-tieba-sign": {
+        "description": "LuCI Tieba Sign-in access",
+        "read": {
+            "ubus": {
+                "tieba-sign": [ "status", "status_log", "log", "clear_log", "qr_start", "qr_poll",
+                                "forums_list", "forums_debug_raw", "sign_result", "sign_history", "account_check" ],
+                "uci": [ "get", "state" ]
+            },
+            "uci": {
+                "tieba-sign": [ "*" ]
+            }
+        },
+        "write": {
+            "ubus": {
+                "tieba-sign": [ "run", "resume", "stop", "forums_update", "forum_unfollow" ],
+                "uci": [ "set", "add", "delete", "commit", "apply", "confirm", "order" ]
+            },
+            "uci": {
+                "tieba-sign": [ "*" ]
+            }
+        }
+    }
+}

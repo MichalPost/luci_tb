@@ -1,0 +1,284 @@
+#!/usr/bin/env node
+'use strict';
+// /usr/libexec/rpcd/tieba-sign
+// rpcd plugin — called by rpcd as: tieba-sign list | tieba-sign call <method>
+// stdin carries JSON params for "call" methods; stdout must be valid JSON
+
+const fs    = require('fs');
+const https = require('https');
+const { spawnSync, spawn } = require('child_process');
+// Built-in fetch (Node v18+) used for HTTPS requests
+
+const SIGN_BIN     = '/usr/bin/tieba-sign';
+const QR_STATE     = '/tmp/tieba-sign/qr_state.json';
+const WORK_DIR     = '/tmp/tieba-sign';
+const STOP_FILE    = `${WORK_DIR}/stop`;
+const NODE         = process.execPath;   // path to node itself
+
+// ── helpers ──────────────────────────────────────────────────────────────────
+
+function out(obj) { process.stdout.write(JSON.stringify(obj) + '\n'); }
+
+function runSync(args) {
+  const r = spawnSync(NODE, [SIGN_BIN, ...args], {
+    encoding: 'utf8',
+    timeout: 30000,
+    maxBuffer: 32 * 1024 * 1024,
+  });
+  return (r.stdout || '').trim();
+}
+
+function runBg(args) {
+  const child = spawn(NODE, [SIGN_BIN, ...args], {
+    detached: true, stdio: 'ignore',
+  });
+  child.unref();
+  return child.pid;
+}
+
+function readStdin() {
+  return new Promise(resolve => {
+    let buf = '';
+    process.stdin.setEncoding('utf8');
+    process.stdin.on('data', c => buf += c);
+    process.stdin.on('end', () => resolve(buf));
+    process.stdin.on('error', () => resolve(buf));
+  });
+}
+
+function parseInput(raw) {
+  try { return JSON.parse(raw || '{}'); } catch(_) { return {}; }
+}
+
+const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36';
+
+async function httpsGet(url) {
+  const res = await fetch(url, {
+    headers: { 'User-Agent': UA },
+    signal: AbortSignal.timeout(10000),
+  });
+  const body = await res.text();
+  return { status: res.status, headers: Object.fromEntries(res.headers), body };
+}
+
+// ── lock helpers ──────────────────────────────────────────────────────────────
+function acquireLock() {
+  const lockDir  = `${WORK_DIR}/update.lock.d`;
+  const lockFile = `${WORK_DIR}/update.lock`;
+  try {
+    fs.mkdirSync(lockDir);
+    return lockFile;
+  } catch(_) {
+    // already exists — check if pid is still alive
+    try {
+      const pid = parseInt(fs.readFileSync(lockFile, 'utf8'));
+      if (pid && process.kill(pid, 0)) return null; // still running
+    } catch(_) {}
+    // stale lock — remove and retry
+    try { fs.rmdirSync(lockDir); } catch(_) {}
+    try { fs.mkdirSync(lockDir); return lockFile; } catch(_) { return null; }
+  }
+}
+
+function releaseLock() {
+  try { fs.rmdirSync(`${WORK_DIR}/update.lock.d`); } catch(_) {}
+}
+
+// ── main ──────────────────────────────────────────────────────────────────────
+(async () => {
+  const cmd    = process.argv[2];
+  const method = process.argv[3];
+
+  if (cmd === 'list') {
+    out({
+      status: {}, status_log: {}, run: {}, resume: {}, stop: {}, log: {}, clear_log: {},
+      qr_start: {}, qr_poll: { sign: '' },
+      forums_list:   { sid: '' },
+      forums_debug_raw: { sid: '' },
+      forums_update: { sid: '' },
+      sign_result:   { sid: '' },
+      sign_history:  {},
+      forum_unfollow:{ sid: '', name: '', fid: '' },
+      account_check: { sid: '' },
+    });
+    return;
+  }
+
+  if (cmd !== 'call') {
+    out({ error: `unknown command: ${cmd}` });
+    return;
+  }
+
+  const raw   = await readStdin();
+  const input = parseInput(raw);
+
+  switch (method) {
+
+    case 'status': {
+      const text = runSync(['status']);
+      try { process.stdout.write(text + '\n'); }
+      catch(_) { out({ state:'idle', message:'未运行', timestamp:'', accounts:[] }); }
+      break;
+    }
+
+    case 'status_log': {
+      let statusObj = { state:'idle', message:'尚未运行', timestamp:'', accounts:[] };
+      try {
+        statusObj = JSON.parse(fs.readFileSync(`${WORK_DIR}/status.json`, 'utf8'));
+      } catch (_) {}
+      let logText = '暂无日志';
+      try {
+        logText = fs.readFileSync(`${WORK_DIR}/run.log`, 'utf8');
+      } catch (_) {}
+      out({ status: statusObj, result: logText });
+      break;
+    }
+
+    case 'account_check': {
+      const text = runSync(['account_check', input.sid || '']);
+      try { process.stdout.write(text + '\n'); }
+      catch (_) { out({ ok: false, error: 'rpc_failed' }); }
+      break;
+    }
+
+    case 'run': {
+      fs.mkdirSync(WORK_DIR, { recursive: true });
+      runBg(['run']);
+      out({ result: 'started' });
+      break;
+    }
+
+    case 'resume': {
+      fs.mkdirSync(WORK_DIR, { recursive: true });
+      runBg(['run', 'resume']);
+      out({ result: 'started' });
+      break;
+    }
+
+    case 'stop': {
+      fs.mkdirSync(WORK_DIR, { recursive: true });
+      try { fs.writeFileSync(STOP_FILE, '1'); } catch (_) {}
+      out({ result: 'ok' });
+      break;
+    }
+
+    case 'log': {
+      const text = runSync(['log']);
+      process.stdout.write(text + '\n');
+      break;
+    }
+
+    case 'clear_log': {
+      try { fs.unlinkSync(`${WORK_DIR}/run.log`); } catch(_) {}
+      try { fs.unlinkSync(`${WORK_DIR}/status.json`); } catch(_) {}
+      out({ result: 'ok' });
+      break;
+    }
+
+    case 'forums_list': {
+      const text = runSync(['forums_list', input.sid || '']);
+      process.stdout.write(text + '\n');
+      break;
+    }
+
+    case 'forums_debug_raw': {
+      const text = runSync(['debug_forum_like_page', input.sid || '']);
+      process.stdout.write(text + '\n');
+      break;
+    }
+
+    case 'sign_result': {
+      const text = runSync(['sign_result', input.sid || '']);
+      process.stdout.write(text + '\n');
+      break;
+    }
+
+    case 'sign_history': {
+      const text = runSync(['sign_history']);
+      process.stdout.write(text + '\n');
+      break;
+    }
+
+    case 'forums_update': {
+      fs.mkdirSync(WORK_DIR, { recursive: true });
+      const lockFile = acquireLock();
+      if (!lockFile) { out({ result: 'already_running' }); break; }
+      const pid = runBg(['update_forums', input.sid || '']);
+      try { fs.writeFileSync(lockFile, String(pid)); } catch(_) {}
+      releaseLock();
+      out({ result: 'started' });
+      break;
+    }
+
+    case 'forum_unfollow': {
+      const text = runSync(['unfollow_one', input.sid || '', input.name || '', input.fid || '']);
+      out({ result: text });
+      break;
+    }
+
+    case 'qr_start': {
+      fs.mkdirSync(WORK_DIR, { recursive: true });
+      try {
+        const res = await httpsGet('https://passport.baidu.com/v2/api/getqrcode?lp=pc');
+        const data = JSON.parse(res.body);
+        if (!data.sign) { out({ errno: -2, msg: '获取二维码失败', sign: '', imgurl: '', imgdata: '' }); break; }
+
+        let imgurl = data.imgurl || '';
+        if (imgurl.startsWith('//')) imgurl = 'https:' + imgurl;
+        else if (!imgurl.startsWith('http')) imgurl = 'https://' + imgurl;
+
+        fs.writeFileSync(QR_STATE, JSON.stringify({ sign: data.sign, imgurl, ts: Date.now() }));
+
+        // Fetch QR image as base64 to avoid browser CORS
+        let imgdata = '';
+        try {
+          const imgRes = await httpsGet(imgurl);
+          imgdata = Buffer.from(imgRes.body, 'binary').toString('base64');
+        } catch(_) {}
+
+        out({ errno: 0, msg: 'ok', sign: data.sign, imgurl, imgdata });
+      } catch(e) {
+        out({ errno: -1, msg: e.message, sign: '', imgurl: '', imgdata: '' });
+      }
+      break;
+    }
+
+    case 'qr_poll': {
+      let sign = input.sign || '';
+      if (!sign) {
+        try { sign = JSON.parse(fs.readFileSync(QR_STATE, 'utf8')).sign || ''; } catch(_) {}
+      }
+      if (!sign) { out({ errno: -1, status: -1, msg: '无效的 sign', bduss: '' }); break; }
+
+      try {
+        const res = await httpsGet(`https://passport.baidu.com/channel/unicast?channel_id=${sign}&callback=`);
+        // Strip JSONP wrapper
+        const json = res.body.replace(/^[^(]*\(/, '').replace(/\)\s*$/, '');
+        const obj  = JSON.parse(json);
+
+        if (obj.errno !== 0) { out({ errno: obj.errno || -1, status: 0, msg: '等待扫码', bduss: '' }); break; }
+
+        const cv = typeof obj.channel_v === 'string' ? JSON.parse(obj.channel_v) : obj.channel_v;
+        if (cv.status === 1) { out({ errno: 0, status: 1, msg: '已扫码，请在手机上确认', bduss: '' }); break; }
+        if (!cv.v) { out({ errno: -3, status: -1, msg: '解析 bduss_v 失败', bduss: '' }); break; }
+
+        // Exchange bduss_v → BDUSS via Set-Cookie
+        const loginRes = await httpsGet(`https://passport.baidu.com/v3/login/main/qrbdusslogin?bduss=${cv.v}`);
+        const cookies  = loginRes.headers['set-cookie'] || [];
+        let bduss = '';
+        for (const c of cookies) { const m = c.match(/BDUSS=([^;]+)/); if (m) bduss = m[1]; }
+
+        if (!bduss) { out({ errno: -4, status: -1, msg: '获取 BDUSS 失败', bduss: '' }); break; }
+
+        try { fs.unlinkSync(QR_STATE); } catch(_) {}
+        out({ errno: 0, status: 2, msg: '登录成功', bduss });
+      } catch(e) {
+        out({ errno: -99, status: -1, msg: e.message, bduss: '' });
+      }
+      break;
+    }
+
+    default:
+      out({ error: `unknown method: ${method}` });
+  }
+})();

@@ -1,0 +1,1183 @@
+#!/usr/bin/env node
+'use strict';
+// /usr/bin/tieba-sign  — Node.js rewrite (replaces shell script)
+// Depends: node >= 18 (built-in fetch). 不使用 undici，便于 OpenWrt 等精简 Node 环境。
+
+const fs     = require('fs');
+const path   = require('path');
+const crypto = require('crypto');
+const http   = require('http');
+const net    = require('net');
+const tls    = require('tls');
+const { execSync } = require('child_process');
+const { URL } = require('url');
+
+// ─── Constants ────────────────────────────────────────────────────────────────
+const WORK_DIR   = '/tmp/tieba-sign';
+const PERSIST_DIR= '/etc/tieba-sign';
+const STATUS_FILE= `${WORK_DIR}/status.json`;
+const STOP_FILE  = `${WORK_DIR}/stop`;
+const RUN_LOCK_DIR  = `${WORK_DIR}/run.lock.d`;
+const RUN_LOCK_FILE = `${WORK_DIR}/run.lock`;
+const LOG_FILE   = `${WORK_DIR}/run.log`;
+const HISTORY_FILE = `${PERSIST_DIR}/sign_history.json`;
+const HISTORY_DAYS_MAX = 10;
+
+const API = {
+  TBS_URL       : 'http://tieba.baidu.com/dc/common/tbs',
+  SIGN_URL      : 'http://c.tieba.baidu.com/c/c/forum/sign',
+  FORUM_LIST_URL: 'http://c.tieba.baidu.com/c/f/forum/like',
+  UNFOLLOW_URL  : 'http://c.tieba.baidu.com/c/c/forum/unfavolike',
+  SIGN_KEY      : 'tiebaclient!!!',
+};
+
+const CLIENT = {
+  TYPE   : '2',
+  ID     : 'wappc_1534235498291_488',
+  VERSION: '9.7.8.0',
+  IMEI   : '000000000000000',
+  MODEL  : 'MI+5',
+  NET    : '1',
+  FROM   : '1008621y',
+  VCODE  : '11',
+  UA     : 'Mozilla/5.0 (Linux; Android 9; MI 5) AppleWebKit/537.36 Mobile Safari/537.36',
+};
+
+const ERR = {
+  SUCCESS     : '0',
+  ALREADY     : '160002',
+  BANNED      : new Set(['340006','340008']),
+  RATE_LIMIT  : new Set(['1011','1102']),
+};
+
+// ─── Logging ──────────────────────────────────────────────────────────────────
+fs.mkdirSync(WORK_DIR, { recursive: true });
+
+function log(level, msg) {
+  const ts = new Date().toTimeString().slice(0,8);
+  const line = `[${ts}][${level}] ${msg}`;
+  process.stderr.write(line + '\n');
+  try {
+    fs.appendFileSync(LOG_FILE, line + '\n');
+    // Trim log if too large
+    const stat = fs.statSync(LOG_FILE);
+    if (stat.size > 200 * 1024) {
+      const lines = fs.readFileSync(LOG_FILE,'utf8').split('\n');
+      fs.writeFileSync(LOG_FILE, lines.slice(-300).join('\n') + '\n');
+    }
+  } catch(_) {}
+}
+const logInfo  = m => log('INFO ', m);
+const logOk    = m => log('OK   ', m);
+const logWarn  = m => log('WARN ', m);
+const logError = m => log('ERROR', m);
+
+/** 当前会话的 HTTP 代理 URL（与 UCI proxy 一致）；空串表示直连 */
+let gProxyUrl = '';
+
+function setProxyFromCfg(cfg) {
+  gProxyUrl = cfg && cfg.proxy ? String(cfg.proxy).trim() : '';
+}
+
+/** 将 Node 响应缓冲封装成类 fetch Response（仅本脚本用到的接口） */
+function wrapNodeResponse(statusCode, buf) {
+  const text = () => Promise.resolve(buf.toString('utf8'));
+  const json = () => Promise.resolve(JSON.parse(buf.toString('utf8')));
+  return {
+    ok: statusCode >= 200 && statusCode < 300,
+    status: statusCode || 0,
+    text,
+    json,
+  };
+}
+
+/** HTTP 目标经 HTTP 代理（绝对 URI 作为 path） */
+function httpOverHttpProxy(targetUrlStr, init) {
+  const target = new URL(targetUrlStr);
+  const proxy = new URL(gProxyUrl);
+  const method = init.method || 'GET';
+  const hdrIn = Object.assign({}, init.headers || {});
+  const bodyStr = init.body != null ? String(init.body) : null;
+  const bodyBuf = bodyStr ? Buffer.from(bodyStr, 'utf8') : null;
+  if (bodyBuf) hdrIn['Content-Length'] = String(bodyBuf.length);
+  hdrIn['Host'] = target.port && target.port !== '80'
+    ? `${target.hostname}:${target.port}`
+    : target.hostname;
+
+  const timeoutMs = init.__timeoutMs || 120000;
+  return new Promise((resolve, reject) => {
+    const req = http.request({
+      hostname: proxy.hostname,
+      port: proxy.port || 80,
+      path: targetUrlStr,
+      method,
+      headers: hdrIn,
+    }, (res) => {
+      const chunks = [];
+      res.on('data', (c) => chunks.push(c));
+      res.on('end', () => {
+        const buf = Buffer.concat(chunks);
+        resolve(wrapNodeResponse(res.statusCode || 0, buf));
+      });
+    });
+    req.on('error', reject);
+    req.setTimeout(timeoutMs, () => {
+      req.destroy();
+      const e = new Error('timeout');
+      e.name = 'AbortError';
+      reject(e);
+    });
+    if (init.signal) {
+      const abort = () => {
+        req.destroy();
+        const e = new Error('Aborted');
+        e.name = 'AbortError';
+        reject(e);
+      };
+      if (init.signal.aborted) abort();
+      else init.signal.addEventListener('abort', abort, { once: true });
+    }
+    if (bodyBuf) req.write(bodyBuf);
+    req.end();
+  });
+}
+
+function headerContentLength(headerText) {
+  for (const line of headerText.split('\r\n').slice(1)) {
+    const m = /^content-length:\s*(\d+)/i.exec(line);
+    if (m) return parseInt(m[1], 10);
+  }
+  return null;
+}
+
+/** 建立到目标端口的 TLS socket（经 HTTP 代理 CONNECT） */
+function connectTlsViaHttpProxy(hostname, port, timeoutMs) {
+  const proxy = new URL(gProxyUrl);
+  return new Promise((resolve, reject) => {
+    const sock = net.connect(proxy.port || 80, proxy.hostname);
+    const timer = setTimeout(() => {
+      sock.destroy();
+      reject(Object.assign(new Error('timeout'), { name: 'AbortError' }));
+    }, timeoutMs);
+    const fail = (e) => { clearTimeout(timer); try { sock.destroy(); } catch (_) {} reject(e); };
+    sock.once('error', fail);
+    sock.write(
+      `CONNECT ${hostname}:${port} HTTP/1.1\r\n` +
+      `Host: ${hostname}:${port}\r\n` +
+      `\r\n`
+    );
+    let buf = Buffer.alloc(0);
+    sock.on('data', onData);
+    function onData(chunk) {
+      buf = Buffer.concat([buf, chunk]);
+      const sep = buf.indexOf('\r\n\r\n');
+      if (sep === -1) return;
+      sock.removeListener('data', onData);
+      const head = buf.slice(0, sep).toString('utf8');
+      const line0 = head.split('\r\n')[0] || '';
+      if (!line0.includes('200')) {
+        return fail(new Error('Proxy CONNECT failed: ' + line0));
+      }
+      const leftover = buf.slice(sep + 4);
+      if (leftover.length) sock.unshift(leftover);
+      const tlsSock = tls.connect({
+        socket: sock,
+        servername: hostname,
+        rejectUnauthorized: true,
+      }, () => {
+        clearTimeout(timer);
+        resolve(tlsSock);
+      });
+      tlsSock.once('error', fail);
+    }
+  });
+}
+
+/** 在 TLS 套接字上读完整 HTTP/1.1 响应（依 Content-Length 或直到对端关闭） */
+function readHttp1ResponseOnSocket(socket, timeoutMs, signal) {
+  return new Promise((resolve, reject) => {
+    let buf = Buffer.alloc(0);
+    let settled = false;
+    const finish = (fn) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(to);
+      if (signal) signal.removeEventListener('abort', onAbort);
+      fn();
+    };
+
+    const to = setTimeout(() => {
+      try { socket.destroy(); } catch (_) {}
+      finish(() => reject(Object.assign(new Error('timeout'), { name: 'AbortError' })));
+    }, timeoutMs);
+
+    const onAbort = () => {
+      try { socket.destroy(); } catch (_) {}
+      finish(() => reject(Object.assign(new Error('Aborted'), { name: 'AbortError' })));
+    };
+    if (signal) signal.addEventListener('abort', onAbort, { once: true });
+
+    socket.on('data', (d) => {
+      if (settled) return;
+      buf = Buffer.concat([buf, d]);
+      const sep = buf.indexOf('\r\n\r\n');
+      if (sep === -1) return;
+      const headStr = buf.slice(0, sep).toString('utf8');
+      const cl = headerContentLength(headStr);
+      const statusLine = headStr.split('\r\n')[0] || '';
+      const code = parseInt(statusLine.split(/\s+/)[1], 10) || 0;
+      const bodyStart = sep + 4;
+      if (cl != null) {
+        if (buf.length < bodyStart + cl) return;
+        try { socket.destroy(); } catch (_) {}
+        return finish(() => resolve(wrapNodeResponse(code, buf.slice(bodyStart, bodyStart + cl))));
+      }
+    });
+    socket.on('end', () => {
+      if (settled) return;
+      const sep = buf.indexOf('\r\n\r\n');
+      if (sep === -1)
+        return finish(() => resolve(wrapNodeResponse(0, Buffer.alloc(0))));
+      const headStr = buf.slice(0, sep).toString('utf8');
+      const statusLine = headStr.split('\r\n')[0] || '';
+      const code = parseInt(statusLine.split(/\s+/)[1], 10) || 0;
+      finish(() => resolve(wrapNodeResponse(code, buf.slice(sep + 4))));
+    });
+    socket.on('error', (e) => finish(() => reject(e)));
+  });
+}
+
+/** HTTPS 经 HTTP 代理（Webhook 等小响应） */
+async function httpsOverHttpProxy(targetUrlStr, init) {
+  const u = new URL(targetUrlStr);
+  const method = init.method || 'GET';
+  const hdrIn = Object.assign({}, init.headers || {});
+  const bodyStr = init.body != null ? String(init.body) : null;
+  const bodyBuf = bodyStr ? Buffer.from(bodyStr, 'utf8') : null;
+  if (bodyBuf) hdrIn['Content-Length'] = String(bodyBuf.length);
+  const pathQuery = u.pathname + u.search + u.hash;
+  const timeoutMs = init.__timeoutMs || 30000;
+
+  const tlsSock = await connectTlsViaHttpProxy(u.hostname, 443, timeoutMs);
+  let raw = `${method} ${pathQuery} HTTP/1.1\r\nHost: ${u.hostname}\r\n`;
+  for (const [k, v] of Object.entries(hdrIn))
+    raw += `${k}: ${v}\r\n`;
+  raw += '\r\n';
+  tlsSock.write(Buffer.from(raw, 'utf8'));
+  if (bodyBuf) tlsSock.write(bodyBuf);
+
+  return readHttp1ResponseOnSocket(tlsSock, timeoutMs, init.signal);
+}
+
+/**
+ * 与 fetch 类似；有代理时走 http/https 核心实现，避免依赖 undici。
+ */
+async function smartFetch(urlStr, init) {
+  const initEx = init || {};
+  if (!gProxyUrl) return fetch(urlStr, initEx);
+
+  let u;
+  try {
+    u = new URL(urlStr);
+  } catch (e) {
+    return fetch(urlStr, initEx);
+  }
+
+  try {
+    new URL(gProxyUrl);
+  } catch (e) {
+    logWarn(`代理地址无效，将直连: ${e.message}`);
+    return fetch(urlStr, initEx);
+  }
+
+  if (u.protocol === 'http:')
+    return httpOverHttpProxy(urlStr, initEx);
+  if (u.protocol === 'https:')
+    return httpsOverHttpProxy(urlStr, initEx);
+  return fetch(urlStr, initEx);
+}
+
+async function asyncPool(poolLimit, items, iteratorFn) {
+  const limit = Math.max(1, poolLimit);
+  const executing = [];
+  for (const item of items) {
+    const p = Promise.resolve().then(() => iteratorFn(item));
+    const e = p.then(() => {
+      const ix = executing.indexOf(e);
+      if (ix >= 0) executing.splice(ix, 1);
+    });
+    executing.push(e);
+    if (executing.length >= limit) await Promise.race(executing);
+  }
+  await Promise.all(executing);
+}
+
+// ─── HTTP helpers (built-in fetch, Node v18+) ────────────────────────────────
+function httpTimeoutMs(ms) {
+  return Math.max(5000, ms || 20000);
+}
+
+function encodeForm(obj) {
+  return new URLSearchParams(obj).toString();
+}
+
+async function postForm(url, data, bduss, timeoutMs) {
+  const ms = httpTimeoutMs(timeoutMs);
+  const res = await smartFetch(url, {
+    method : 'POST',
+    headers: { 'User-Agent': CLIENT.UA, 'Cookie': `BDUSS=${bduss}` },
+    body   : encodeForm(data),
+    signal: AbortSignal.timeout(ms),
+    __timeoutMs: ms,
+  });
+  return res.json();
+}
+
+async function getJson(url, bduss, timeoutMs) {
+  const ms = httpTimeoutMs(timeoutMs);
+  const res = await smartFetch(url, {
+    headers: { 'User-Agent': CLIENT.UA, 'Cookie': `BDUSS=${bduss}` },
+    signal: AbortSignal.timeout(ms),
+    __timeoutMs: ms,
+  });
+  return res.json();
+}
+
+/** 签到请求可被 /tmp/tieba-sign/stop 中断（Abort），避免长时间卡在单次 HTTP */
+async function postFormStopAware(url, data, bduss, timeoutMs) {
+  const ac = new AbortController();
+  const ms = httpTimeoutMs(timeoutMs);
+  const poll = setInterval(() => {
+    if (shouldStop()) ac.abort();
+  }, 250);
+  const to = setTimeout(() => ac.abort(), ms);
+  try {
+    const res = await smartFetch(url, {
+      method: 'POST',
+      headers: { 'User-Agent': CLIENT.UA, 'Cookie': `BDUSS=${bduss}` },
+      body: encodeForm(data),
+      signal: ac.signal,
+      __timeoutMs: ms,
+    });
+    return res.json();
+  } finally {
+    clearInterval(poll);
+    clearTimeout(to);
+  }
+}
+
+// ─── Signature ────────────────────────────────────────────────────────────────
+function generateSign(data) {
+  const sorted = Object.keys(data).sort();
+  const str = sorted.map(k => `${k}=${data[k]}`).join('') + API.SIGN_KEY;
+  return crypto.createHash('md5').update(str, 'utf8').digest('hex').toUpperCase();
+}
+
+// ─── UCI config ───────────────────────────────────────────────────────────────
+// 批量读取 UCI，一次 execSync 获取所有配置，减少子进程开销
+function uciShowAll() {
+  try {
+    return execSync('uci -q show tieba-sign 2>/dev/null', { encoding: 'utf8' });
+  } catch(_) { return ''; }
+}
+
+function parseUciShow(raw) {
+  const map = {};
+  for (const line of raw.split('\n')) {
+    const eq = line.indexOf('=');
+    if (eq < 0) continue;
+    const key = line.slice(0, eq).trim();
+    let val = line.slice(eq + 1).trim();
+    // strip surrounding quotes
+    if (val.startsWith("'") && val.endsWith("'")) val = val.slice(1, -1);
+    map[key] = val;
+  }
+  return map;
+}
+
+function parseDelayRangeSec(g) {
+  let minS = parseFloat(g('sign_delay_min') || '1');
+  let maxS = parseFloat(g('sign_delay_max') || '2');
+  if (isNaN(minS) || minS < 0) minS = 1;
+  if (isNaN(maxS) || maxS < 0) maxS = 2;
+  if (maxS < minS) [minS, maxS] = [maxS, minS];
+  minS = Math.min(minS, 120);
+  maxS = Math.min(maxS, 120);
+  return { signDelayMinMs: minS * 1000, signDelayMaxMs: maxS * 1000 };
+}
+
+function loadGlobalConfig() {
+  const raw = uciShowAll();
+  const m   = parseUciShow(raw);
+  const g   = k => m[`tieba-sign.main.${k}`] || '';
+  const dr  = parseDelayRangeSec(g);
+  return {
+    enabled       : g('enabled') === '1',
+    timeout       : parseInt(g('timeout') || '20') * 1000,
+    maxRetries    : parseInt(g('max_retries') || '2'),
+    autoUnfollow  : g('auto_unfollow_banned') !== '0',
+    showSignedLog : g('show_signed_log') === '1',
+    updateDays    : parseInt(g('forum_update_days') || '7'),
+    proxy         : g('proxy') || '',
+    blacklist     : new Set((g('blacklist') || '').split(/\s+/).filter(Boolean)),
+    concurrency   : Math.min(8, Math.max(1, parseInt(g('concurrency') || '1', 10) || 1)),
+    webhookUrl    : g('webhook_url') || '',
+    signDelayMinMs  : dr.signDelayMinMs,
+    signDelayMaxMs  : dr.signDelayMaxMs,
+    _raw          : m,   // keep for getSections
+  };
+}
+
+function uciGet(key) {
+  try { return execSync(`uci -q get ${key} 2>/dev/null`, {encoding:'utf8'}).trim(); }
+  catch(_) { return ''; }
+}
+
+function getSections(rawMap) {
+  // rawMap from loadGlobalConfig()._raw, or re-read if not provided
+  const m = rawMap || parseUciShow(uciShowAll());
+  const seen = new Set();
+  const sections = [];
+  for (const key of Object.keys(m)) {
+    // keys like tieba-sign.cfg123456.enabled
+    const parts = key.split('.');
+    if (parts.length >= 3 && parts[0] === 'tieba-sign') {
+      const sec = parts[1];
+      if (!seen.has(sec) && m[`tieba-sign.${sec}`] === 'account') {
+        seen.add(sec);
+        sections.push(sec);
+      }
+    }
+  }
+  return sections;
+}
+
+// ─── Filename safe sid ────────────────────────────────────────────────────────
+function sidToFilename(sid) {
+  return sid.replace(/[@[\]]/g, '_');
+}
+
+// ─── Persist helpers ──────────────────────────────────────────────────────────
+function readJson(file, fallback = null) {
+  try { return JSON.parse(fs.readFileSync(file, 'utf8')); }
+  catch(_) { return fallback; }
+}
+
+function writeJson(file, data) {
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(file, JSON.stringify(data, null, 2) + '\n', 'utf8');
+}
+
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+function rand(min, max) { return min + Math.random() * (max - min); }
+
+function shouldStop() {
+  try { return fs.existsSync(STOP_FILE); } catch (_) { return false; }
+}
+
+function clearStopFile() {
+  try { fs.unlinkSync(STOP_FILE); } catch (_) {}
+}
+
+/** 防止 cron 与手动签到同时启动两个进程：后者会 clearStopFile() 清掉前者的停止标志 */
+function tryAcquireRunLock() {
+  try {
+    fs.mkdirSync(RUN_LOCK_DIR);
+    fs.writeFileSync(RUN_LOCK_FILE, String(process.pid));
+    return true;
+  } catch (_) {
+    try {
+      const pid = parseInt(fs.readFileSync(RUN_LOCK_FILE, 'utf8'), 10);
+      if (pid && !isNaN(pid)) {
+        try {
+          process.kill(pid, 0);
+          return false;
+        } catch (_) { /* stale pid */ }
+      }
+    } catch (_) {}
+    try { fs.unlinkSync(RUN_LOCK_FILE); } catch (_) {}
+    try { fs.rmdirSync(RUN_LOCK_DIR); } catch (_) {}
+    try {
+      fs.mkdirSync(RUN_LOCK_DIR);
+      fs.writeFileSync(RUN_LOCK_FILE, String(process.pid));
+      return true;
+    } catch (_) {
+      return false;
+    }
+  }
+}
+
+function releaseRunLock() {
+  try {
+    const mine = fs.readFileSync(RUN_LOCK_FILE, 'utf8').trim();
+    if (mine !== String(process.pid)) return;
+  } catch (_) {
+    return;
+  }
+  try { fs.unlinkSync(RUN_LOCK_FILE); } catch (_) {}
+  try { fs.rmdirSync(RUN_LOCK_DIR); } catch (_) {}
+}
+
+function consumeStopFile() {
+  try { fs.unlinkSync(STOP_FILE); } catch (_) {}
+}
+
+function tallySignResults(forums, signResults) {
+  let cntSuccess = 0, cntSigned = 0, cntFail = 0, cntBanned = 0, totalExp = 0;
+  for (const f of forums) {
+    const r = signResults[f.id];
+    if (!r) continue;
+    if (r.status === 'signed') { cntSuccess++; totalExp += r.exp || 0; }
+    else if (r.status === 'already') cntSigned++;
+    else if (r.status === 'banned') cntBanned++;
+    else if (r.status === 'fail') cntFail++;
+  }
+  return { cntSuccess, cntSigned, cntFail, cntBanned, totalExp };
+}
+
+function formatSignSummary(t, stoppedTag) {
+  const n = t.cntSuccess + t.cntSigned + t.cntFail + t.cntBanned;
+  let s = `新签到:${t.cntSuccess}(+${t.totalExp}exp) 已签:${t.cntSigned} 封禁:${t.cntBanned} 失败:${t.cntFail} 共:${n}`;
+  if (stoppedTag) s += ' [已停止]';
+  return s;
+}
+
+function finalizeAccountStop(note, sid, forums, signResults, completedSiblingRows) {
+  saveSignResult(sid, signResults);
+  const t = tallySignResults(forums, signResults);
+  const partialSummary = formatSignSummary(t, true);
+  writeStatus('stopped', '用户已停止', [
+    ...completedSiblingRows,
+    { name: note, state: 'stopped', message: partialSummary },
+  ]);
+  logWarn(`[${note}] 已按请求停止，进度已保存；可点击「断点续签」继续`);
+  consumeStopFile();
+  return { stopped: true };
+}
+
+// ─── Login ────────────────────────────────────────────────────────────────────
+async function initLogin(bduss, note, timeoutMs) {
+  for (let i = 0; i < 3; i++) {
+    try {
+      if (i > 0) await sleep(2000);
+      const data = await getJson(API.TBS_URL, bduss, timeoutMs);
+      if (data.is_login === 1) {
+        logOk(`[${note}] 登录成功`);
+        return data.tbs;
+      }
+      logError(`[${note}] BDUSS 无效或已过期`);
+      return null;
+    } catch(e) {
+      logWarn(`[${note}] 登录超时 (${i+1}/3)`);
+    }
+  }
+  logError(`[${note}] 登录失败：多次超时`);
+  return null;
+}
+
+// ─── Fetch forum list ─────────────────────────────────────────────────────────
+async function fetchForums(bduss, note, timeoutMs) {
+  const forums = [];
+  logInfo(`[${note}] 从 API 获取贴吧列表...`);
+
+  for (let page = 1; page <= 10; page++) {
+    const ts = String(Math.floor(Date.now() / 1000));
+    const payload = {
+      BDUSS: bduss, _client_id: CLIENT.ID, _client_type: CLIENT.TYPE,
+      _client_version: CLIENT.VERSION, _phone_imei: CLIENT.IMEI,
+      from: CLIENT.FROM, model: CLIENT.MODEL, net_type: CLIENT.NET,
+      page_no: String(page), page_size: '200', timestamp: ts,
+      vcode_tag: CLIENT.VCODE,
+    };
+    payload.sign = generateSign(payload);
+
+    let data;
+    try {
+      data = await postForm(API.FORUM_LIST_URL, payload, bduss, timeoutMs);
+    } catch(e) {
+      logWarn(`[${note}] 第 ${page} 页请求失败: ${e.message}`);
+      break;
+    }
+
+    // 解析 forum_list，兼容对象和数组两种格式（参考 Python 版本）
+    const raw = data.forum_list || {};
+    const batch = Array.isArray(raw)
+      ? raw
+      : [...(raw['non-gconforum'] || []), ...(raw['gconforum'] || [])];
+
+    logInfo(`[${note}] 第 ${page} 页: ${batch.length} 个贴吧`);
+    if (!batch.length) break;
+
+    for (const f of batch) {
+      if (f.name) forums.push({ name: f.name, id: String(f.id || ''), level: f.level_id || 0, fans: f.member_num || 0, banned: 0 });
+    }
+
+    const hasMore = String(data.has_more) === '1' || data.has_more === true;
+    if (!hasMore) break;
+    await sleep(500);
+  }
+
+  // 去重
+  const seen = new Set();
+  return forums.filter(f => { if (seen.has(f.id)) return false; seen.add(f.id); return true; });
+}
+
+// ─── Save forums JSON ─────────────────────────────────────────────────────────
+function saveForumsJson(sid, forums) {
+  const file = `${PERSIST_DIR}/forums_${sidToFilename(sid)}.json`;
+  const ts = new Date().toLocaleString('zh-CN', { hour12: false }).replace(/\//g, '-');
+  writeJson(file, { updated: ts, forums });
+  logOk(`贴吧列表已持久化 → ${file} (${forums.length} 个)`);
+}
+
+function loadForumsJson(sid) {
+  const file = `${PERSIST_DIR}/forums_${sidToFilename(sid)}.json`;
+  return readJson(file);
+}
+
+function loadSignResult(sid) {
+  const file = `${WORK_DIR}/sign_result_${sidToFilename(sid)}.json`;
+  return readJson(file, { date: '', results: {} });
+}
+
+function saveSignResult(sid, results) {
+  const file = `${WORK_DIR}/sign_result_${sidToFilename(sid)}.json`;
+  const today = new Date().toISOString().slice(0,10);
+  writeJson(file, { date: today, results });
+}
+
+// ─── Sign single forum ────────────────────────────────────────────────────────
+async function signForum(bduss, tbs, forum, note, cfg) {
+  const { name, id } = forum;
+  for (let attempt = 0; attempt < cfg.maxRetries; attempt++) {
+    if (shouldStop()) {
+      logWarn(`[${note}] 停止请求：跳过 【${name}】`);
+      return { status: 'stopped', name, id, exp: 0 };
+    }
+    const ts = String(Math.floor(Date.now() / 1000));
+    const payload = {
+      BDUSS: bduss, _client_type: CLIENT.TYPE, _client_version: CLIENT.VERSION,
+      _phone_imei: CLIENT.IMEI, fid: id, kw: name, model: CLIENT.MODEL,
+      net_type: CLIENT.NET, tbs, timestamp: ts,
+    };
+    payload.sign = generateSign(payload);
+
+    let res;
+    try {
+      res = await postFormStopAware(API.SIGN_URL, payload, bduss, cfg.timeout);
+    } catch(e) {
+      if (shouldStop() || e.name === 'AbortError') {
+        logWarn(`[${note}] 停止请求：已中断 【${name}】`);
+        return { status: 'stopped', name, id, exp: 0 };
+      }
+      if (attempt < cfg.maxRetries - 1) { await sleep(2000); continue; }
+      logError(`[${note}] ❌ 【${name}】网络异常: ${e.message}`);
+      return { status: 'fail', name, id, exp: 0 };
+    }
+
+    const code = String(res.error_code ?? '-1');
+    const exp  = parseInt(res.user_info?.sign_bonus_point || 0);
+    const rank = res.user_info?.user_sign_rank || 0;
+
+    if (code === ERR.SUCCESS) {
+      logOk(`[${note}] ✅ 【${name}】签到成功 (经验+${exp} 排名#${rank})`);
+      const d0 = cfg.signDelayMinMs ?? 1000;
+      const d1 = cfg.signDelayMaxMs ?? 2000;
+      if (d1 > 0 || d0 > 0) await sleep(rand(Math.min(d0, d1), Math.max(d0, d1)));
+      return { status: 'signed', name, id, exp, rank };
+    }
+    if (code === ERR.ALREADY) {
+      if (cfg.showSignedLog) logInfo(`[${note}] ⚪ 【${name}】今日已签到`);
+      return { status: 'already', name, id, exp: 0, rank: 0 };
+    }
+    if (ERR.BANNED.has(code)) {
+      logWarn(`[${note}] 🚫 【${name}】贴吧已封禁`);
+      return { status: 'banned', name, id, exp: 0, rank: 0 };
+    }
+    if (ERR.RATE_LIMIT.has(code)) {
+      logWarn(`[${note}] ⏳ 【${name}】触发限流，等待 5 秒...`);
+      await sleep(5000); attempt--; continue;
+    }
+    if (attempt < cfg.maxRetries - 1) {
+      logWarn(`[${note}] ⚠️  【${name}】失败(${code})，重试...`);
+      await sleep(2000); continue;
+    }
+    logError(`[${note}] ❌ 【${name}】签到失败(${code})`);
+    return { status: 'fail', name, id, exp: 0 };
+  }
+  return { status: 'fail', name, id, exp: 0 };
+}
+
+// ─── Unfollow banned ──────────────────────────────────────────────────────────
+async function unfollowForum(bduss, tbs, forum, note, timeoutMs) {
+  const { name, id } = forum;
+  const ts = String(Math.floor(Date.now() / 1000));
+  const payload = {
+    BDUSS: bduss, _client_type: CLIENT.TYPE, _client_version: CLIENT.VERSION,
+    _phone_imei: CLIENT.IMEI, fid: id, kw: name, model: CLIENT.MODEL,
+    net_type: CLIENT.NET, tbs, timestamp: ts,
+  };
+  payload.sign = generateSign(payload);
+  try {
+    const res = await postForm(API.UNFOLLOW_URL, payload, bduss, timeoutMs);
+    if (String(res.error_code) === '0') {
+      logOk(`[${note}] 🗑️  【${name}】已取消关注`);
+      return true;
+    }
+    logWarn(`[${note}] ⚠️  【${name}】取消关注失败(${res.error_code})`);
+  } catch(e) {
+    logWarn(`[${note}] ⚠️  【${name}】取消关注异常: ${e.message}`);
+  }
+  return false;
+}
+
+// ─── Run one account ──────────────────────────────────────────────────────────
+/** @returns {{ stopped: true } | { stopped: false, state: string, message: string }} */
+async function runAccount(bduss, note, sid, cfg, resume, completedSiblingRows) {
+  completedSiblingRows = completedSiblingRows || [];
+  logInfo(`---------- 账号: ${note} ----------`);
+
+  if (shouldStop()) {
+    writeStatus('stopped', '用户已停止', completedSiblingRows);
+    logWarn('收到停止请求，未开始本账号');
+    consumeStopFile();
+    return { stopped: true };
+  }
+
+  const persistFile = `${PERSIST_DIR}/forums_${sidToFilename(sid)}.json`;
+  let needFetch = false;
+
+  if (!fs.existsSync(persistFile)) {
+    needFetch = true;
+  } else if (cfg.updateDays === 0) {
+    needFetch = true;
+  } else {
+    const ageDays = (Date.now() - fs.statSync(persistFile).mtimeMs) / 86400000;
+    if (ageDays >= cfg.updateDays) needFetch = true;
+  }
+
+  const tbs = await initLogin(bduss, note, cfg.timeout);
+  if (!tbs) {
+    if (!needFetch && fs.existsSync(persistFile)) {
+      logWarn(`[${note}] 登录失败，使用旧的持久化列表（仅展示，无法签到）`);
+      return { stopped: false, state: 'failed', message: '登录失败' };
+    }
+    return { stopped: false, state: 'failed', message: '登录失败' };
+  }
+
+  if (needFetch && tbs) {
+    const forums = await fetchForums(bduss, note, cfg.timeout);
+    if (forums.length > 0) {
+      saveForumsJson(sid, forums);
+    } else {
+      logWarn(`[${note}] 拉取列表为空，使用旧数据（如有）`);
+      if (!fs.existsSync(persistFile)) return { stopped: false, state: 'failed', message: '贴吧列表为空' };
+    }
+  }
+
+  const stored = loadForumsJson(sid);
+  if (!stored || !stored.forums || !stored.forums.length) {
+    logError(`[${note}] 签到列表为空`);
+    return { stopped: false, state: 'failed', message: '签到列表为空' };
+  }
+
+  const forums = stored.forums.filter(f => !cfg.blacklist.has(f.name));
+  const today = new Date().toISOString().slice(0, 10);
+  let signResults = {};
+  if (resume) {
+    const ex = loadSignResult(sid);
+    if (ex && ex.date === today && ex.results) signResults = { ...ex.results };
+  }
+
+  logInfo(`[${note}] 共 ${forums.length} 个贴吧，${resume ? '断点续签' : '开始签到'}...`);
+
+  const pending = [];
+  for (const forum of forums) {
+    const prev = signResults[forum.id];
+    if (resume && prev && (prev.status === 'signed' || prev.status === 'already')) continue;
+    pending.push(forum);
+  }
+
+  const poolLimit = Math.min(8, Math.max(1, cfg.concurrency || 1));
+  let poolStopped = false;
+  let doneInPool = 0;
+
+  await asyncPool(poolLimit, pending, async (forum) => {
+    if (poolStopped || shouldStop()) {
+      poolStopped = true;
+      return;
+    }
+    const res = await signForum(bduss, tbs, forum, note, cfg);
+    if (res.status === 'stopped') {
+      poolStopped = true;
+      return;
+    }
+    signResults[forum.id] = { name: res.name, status: res.status, exp: res.exp || 0, rank: res.rank || 0 };
+
+    doneInPool++;
+    if (doneInPool % 20 === 0) logInfo(`[${note}] 进度 ${doneInPool}/${pending.length}`);
+
+    const t = tallySignResults(forums, signResults);
+    const partialSummary = formatSignSummary(t, false);
+    writeStatus('running', '正在运行...', [{ name: note, state: 'running', message: partialSummary }]);
+
+    saveSignResult(sid, signResults);
+    if (poolLimit === 1) {
+      const d0 = cfg.signDelayMinMs ?? 1000;
+      const d1 = cfg.signDelayMaxMs ?? 2000;
+      if (d1 > 0 || d0 > 0) await sleep(rand(Math.min(d0, d1), Math.max(d0, d1)));
+    }
+  });
+
+  if (poolStopped || shouldStop()) {
+    return finalizeAccountStop(note, sid, forums, signResults, completedSiblingRows);
+  }
+
+  const toUnfollow = forums.filter(f => {
+    const r = signResults[f.id];
+    return r && r.status === 'banned';
+  });
+  if (cfg.autoUnfollow && toUnfollow.length && tbs) {
+    logInfo(`[${note}] 自动取关封禁贴吧...`);
+    for (const f of toUnfollow) { await sleep(1000); await unfollowForum(bduss, tbs, f, note, cfg.timeout); }
+  }
+
+  saveSignResult(sid, signResults);
+
+  const t = tallySignResults(forums, signResults);
+  const summary = formatSignSummary(t, false);
+  logOk(`[${note}] ${summary}`);
+  const state = t.cntFail > 0 ? 'partial' : 'success';
+  return { stopped: false, state, message: summary };
+}
+
+// ─── Status JSON ──────────────────────────────────────────────────────────────
+function writeStatus(state, message, accounts) {
+  const ts = new Date().toLocaleString('zh-CN', { hour12: false }).replace(/\//g, '-');
+  writeJson(STATUS_FILE, { state, message, timestamp: ts, accounts });
+  return ts;
+}
+
+/** 持久化最近 N 天签到摘要（按 UTC 日期键与 sign_result 一致；同日多次运行保留最后一次） */
+function appendSignHistory(overall, message, accounts, timestamp) {
+  const date = new Date().toISOString().slice(0, 10);
+  const raw = readJson(HISTORY_FILE, { days: [] });
+  const prev = Array.isArray(raw.days) ? raw.days : [];
+  const entry = {
+    date,
+    timestamp: timestamp || '',
+    overall,
+    message: message || '',
+    accounts: accounts.map(a => ({ name: a.name, state: a.state, message: a.message })),
+  };
+  const merged = prev.filter(d => d && d.date !== date);
+  merged.push(entry);
+  merged.sort((a, b) => String(b.date || '').localeCompare(String(a.date || '')));
+  writeJson(HISTORY_FILE, { days: merged.slice(0, HISTORY_DAYS_MAX) });
+}
+
+function cmdSignHistory() {
+  const raw = readJson(HISTORY_FILE, { days: [] });
+  const days = Array.isArray(raw.days) ? raw.days : [];
+  console.log(JSON.stringify({ days: days.slice(0, HISTORY_DAYS_MAX) }));
+}
+
+async function notifyWebhook(cfg, payload) {
+  const url = (cfg.webhookUrl || '').trim();
+  if (!url) return;
+  try {
+    await smartFetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+      signal: AbortSignal.timeout(8000),
+      __timeoutMs: 8000,
+    });
+  } catch (_) {}
+}
+
+async function cmdAccountCheck(sid) {
+  const cfg = loadGlobalConfig();
+  setProxyFromCfg(cfg);
+  const acc = resolveAccountForSid(sid || '', cfg);
+  if (!acc || !acc.bduss) {
+    console.log(JSON.stringify({ ok: false, error: 'not_found' }));
+    return;
+  }
+  const tbs = await initLogin(acc.bduss, acc.note, cfg.timeout);
+  console.log(JSON.stringify({ ok: !!tbs, note: acc.note }));
+}
+
+// ─── Commands ─────────────────────────────────────────────────────────────────
+
+async function cmdRun() {
+  const resume = process.argv[3] === 'resume';
+  fs.mkdirSync(WORK_DIR, { recursive: true });
+  if (!tryAcquireRunLock()) {
+    logError('已有签到任务在运行，本次启动已跳过（否则会清掉正在生效的停止请求）');
+    return;
+  }
+  try {
+    clearStopFile();
+    logInfo(`========== 贴吧签到开始 ${resume ? '[断点续签] ' : ''}${new Date().toLocaleString('zh-CN')} ==========`);
+    writeStatus('running', '正在运行...', []);
+
+    const cfg = loadGlobalConfig();
+    setProxyFromCfg(cfg);
+    if (!cfg.enabled) {
+      logError('tieba-sign 未启用');
+      writeStatus('idle', '未启用', []);
+      return;
+    }
+
+    const sections = getSections(cfg._raw);
+    if (!sections.length) {
+      logError('未找到任何账号配置');
+      writeStatus('failed', '未配置账号', []);
+      return;
+    }
+
+    const accountRows = [];
+    let accIdx = 0;
+    let ran = 0;
+    for (const sec of sections) {
+      const r = cfg._raw;
+      const enabled = r[`tieba-sign.${sec}.enabled`] || '';
+      if (enabled !== '1') { accIdx++; continue; }
+      const bduss = r[`tieba-sign.${sec}.bduss`] || '';
+      const note  = r[`tieba-sign.${sec}.note`]  || sec;
+      if (!bduss) { logWarn(`账号 [${note}] BDUSS 为空，跳过`); accIdx++; continue; }
+
+      if (shouldStop()) {
+        writeStatus('stopped', '用户已停止', accountRows);
+        consumeStopFile();
+        logInfo('========== 签到已停止 ==========');
+        return;
+      }
+      if (ran > 0) {
+        await sleep(5000);
+        if (shouldStop()) {
+          writeStatus('stopped', '用户已停止', accountRows);
+          consumeStopFile();
+          logInfo('========== 签到已停止 ==========');
+          return;
+        }
+      }
+
+      const sid = `@account[${accIdx}]`;
+      const ret = await runAccount(bduss, note, sid, cfg, resume, accountRows);
+      if (ret.stopped) {
+        logInfo('========== 签到已停止 ==========');
+        return;
+      }
+      accountRows.push({ name: note, state: ret.state, message: ret.message });
+      ran++;
+      accIdx++;
+    }
+
+    if (accountRows.length === 0) {
+      logWarn('没有可执行的账号');
+      writeStatus('failed', '没有可执行的账号', []);
+      return;
+    }
+
+    const overall = accountRows.every(a => a.state === 'success') ? 'success'
+      : accountRows.some(a => a.state === 'success' || a.state === 'partial') ? 'partial' : 'failed';
+    const ts = writeStatus(overall, `签到完成，共 ${accountRows.length} 个账号`, accountRows);
+    appendSignHistory(overall, `签到完成，共 ${accountRows.length} 个账号`, accountRows, ts);
+    await notifyWebhook(cfg, {
+      event: 'tieba_sign_done',
+      overall,
+      message: `签到完成，共 ${accountRows.length} 个账号`,
+      accounts: accountRows,
+      timestamp: ts,
+    });
+    logInfo('========== 签到结束 ==========');
+  } finally {
+    releaseRunLock();
+  }
+}
+
+function cmdStop() {
+  fs.mkdirSync(WORK_DIR, { recursive: true });
+  try { fs.writeFileSync(STOP_FILE, '1'); } catch (_) {}
+  console.log(JSON.stringify({ result: 'ok' }));
+}
+
+async function cmdUpdateForums(targetSid) {
+  fs.mkdirSync(WORK_DIR, { recursive: true });
+  const cfg = loadGlobalConfig();
+  setProxyFromCfg(cfg);
+  const sections = getSections(cfg._raw);
+  if (!sections.length) { console.log('no accounts'); return; }
+
+  logInfo(`[列表更新] 收到更新请求 sid=${targetSid || '<all>'}`);
+  let matched = 0, updated = 0, accIdx = 0;
+
+  for (const sec of sections) {
+    const r = cfg._raw;
+    const enabled = r[`tieba-sign.${sec}.enabled`] || '';
+    if (enabled !== '1') { accIdx++; continue; }
+
+    const currentSid = `@account[${accIdx}]`;
+    if (targetSid && targetSid !== currentSid && targetSid !== sec) { accIdx++; continue; }
+
+    matched++;
+    const bduss = r[`tieba-sign.${sec}.bduss`] || '';
+    const note  = r[`tieba-sign.${sec}.note`]  || sec;
+    if (!bduss) { accIdx++; continue; }
+
+    const tbs = await initLogin(bduss, note, cfg.timeout);
+    if (!tbs) { logError(`[${note}] 登录失败，跳过`); accIdx++; continue; }
+
+    const forums = await fetchForums(bduss, note, cfg.timeout);
+    const saveSid = targetSid || currentSid;
+    if (forums.length > 0) {
+      saveForumsJson(saveSid, forums);
+      logOk(`[${note}] 更新完成，共 ${forums.length} 个贴吧`);
+      updated++;
+    } else {
+      logWarn(`[${note}] 获取列表为空，保留旧数据`);
+    }
+    accIdx++;
+  }
+
+  if (matched === 0) { logError(`[列表更新] 未匹配到账号 sid=${targetSid || '<all>'}`); return; }
+  if (updated === 0) logWarn(`[列表更新] 已匹配 ${matched} 个账号，但没有任何列表被更新`);
+  else logInfo(`[列表更新] 完成：匹配 ${matched} 个账号，成功更新 ${updated} 个`);
+
+  // Remove lock file
+  try { fs.unlinkSync(`${WORK_DIR}/update.lock`); } catch(_) {}
+}
+
+function cmdForumsList(sid) {
+  const data = loadForumsJson(sid);
+  if (!data) { console.log(JSON.stringify({ error: 'no_data', updated: '', forums: [] })); return; }
+  console.log(JSON.stringify(data));
+}
+
+function cmdSignResult(sid) {
+  const data = loadSignResult(sid);
+  console.log(JSON.stringify(data));
+}
+
+function cmdStatus() {
+  const data = readJson(STATUS_FILE, { state:'idle', message:'尚未运行', timestamp:'', accounts:[] });
+  console.log(JSON.stringify(data));
+}
+
+function cmdLog() {
+  try {
+    const text = fs.readFileSync(LOG_FILE, 'utf8');
+    // JSON.stringify handles \n escaping automatically
+    process.stdout.write(JSON.stringify({ result: text }) + '\n');
+  } catch(_) {
+    process.stdout.write(JSON.stringify({ result: '暂无日志' }) + '\n');
+  }
+}
+
+function resolveAccountForSid(sid, cfg) {
+  const sections = getSections(cfg._raw);
+  let accIdx = 0;
+  for (const sec of sections) {
+    const enabled = cfg._raw[`tieba-sign.${sec}.enabled`] || '';
+    if (enabled !== '1') { accIdx++; continue; }
+    const currentSid = `@account[${accIdx}]`;
+    if (currentSid === sid || sec === sid) {
+      return {
+        bduss: cfg._raw[`tieba-sign.${sec}.bduss`] || '',
+        note: cfg._raw[`tieba-sign.${sec}.note`] || sec,
+      };
+    }
+    accIdx++;
+  }
+  return null;
+}
+
+async function cmdDebugForumLikePage(sid) {
+  const cfg = loadGlobalConfig();
+  setProxyFromCfg(cfg);
+  const acc = resolveAccountForSid(sid || '', cfg);
+  if (!acc) {
+    console.log(JSON.stringify({ ok: false, error: 'not_found' }));
+    return;
+  }
+  if (!acc.bduss) {
+    console.log(JSON.stringify({ ok: false, error: 'no_bduss' }));
+    return;
+  }
+  const { bduss, note } = acc;
+  if (!(await initLogin(bduss, note, cfg.timeout))) {
+    console.log(JSON.stringify({ ok: false, error: 'login_failed' }));
+    return;
+  }
+  const ts = String(Math.floor(Date.now() / 1000));
+  const payload = {
+    BDUSS: bduss, _client_id: CLIENT.ID, _client_type: CLIENT.TYPE,
+    _client_version: CLIENT.VERSION, _phone_imei: CLIENT.IMEI,
+    from: CLIENT.FROM, model: CLIENT.MODEL, net_type: CLIENT.NET,
+    page_no: '1', page_size: '200', timestamp: ts,
+    vcode_tag: CLIENT.VCODE,
+  };
+  payload.sign = generateSign(payload);
+  const ms = Math.max(5000, cfg.timeout || 20000);
+  let raw;
+  try {
+    const res = await smartFetch(API.FORUM_LIST_URL, {
+      method: 'POST',
+      headers: { 'User-Agent': CLIENT.UA, 'Cookie': `BDUSS=${bduss}` },
+      body: encodeForm(payload),
+      signal: AbortSignal.timeout(ms),
+      __timeoutMs: ms,
+    });
+    raw = await res.text();
+  } catch (e) {
+    console.log(JSON.stringify({ ok: false, error: 'request_failed' }));
+    return;
+  }
+  if (!raw) {
+    console.log(JSON.stringify({ ok: false, error: 'empty_response' }));
+    return;
+  }
+  logInfo(`[${note}] [调试] 已抓取 forum/like 第 1 页原始 JSON（长度 ${raw.length}）供前端控制台显示`);
+  console.log(JSON.stringify({ ok: true, page: 1, endpoint: 'c/f/forum/like', raw }));
+}
+
+async function cmdUnfollowOne(sid, name, fid) {
+  const cfg = loadGlobalConfig();
+  setProxyFromCfg(cfg);
+  const acc = resolveAccountForSid(sid, cfg);
+  if (!acc) { console.log('not_found'); return; }
+  const { bduss, note } = acc;
+  if (!bduss) { console.log('login_failed'); return; }
+  const tbs = await initLogin(bduss, note, cfg.timeout);
+  if (!tbs) { console.log('login_failed'); return; }
+  const ok = await unfollowForum(bduss, tbs, { name, id: fid }, note, cfg.timeout);
+  console.log(ok ? 'ok' : 'failed');
+}
+
+// ─── Entry point ──────────────────────────────────────────────────────────────
+(async () => {
+  const [,, cmd, ...args] = process.argv;
+  try {
+    switch (cmd) {
+      case 'run':            await cmdRun(); break;
+      case 'stop':           cmdStop(); break;
+      case 'update_forums':  await cmdUpdateForums(args[0] || ''); break;
+      case 'forums_list':    cmdForumsList(args[0] || ''); break;
+      case 'sign_result':    cmdSignResult(args[0] || ''); break;
+      case 'unfollow_one':   await cmdUnfollowOne(args[0], args[1], args[2]); break;
+      case 'debug_forum_like_page': await cmdDebugForumLikePage(args[0] || ''); break;
+      case 'status':         cmdStatus(); break;
+      case 'log':            cmdLog(); break;
+      case 'sign_history':   cmdSignHistory(); break;
+      case 'account_check':  await cmdAccountCheck(args[0] || ''); break;
+      default:
+        console.error('Usage: tieba-sign {run [resume]|stop|update_forums [sid]|forums_list <sid>|sign_result <sid>|sign_history|account_check <sid>|debug_forum_like_page <sid>|unfollow_one <sid> <name> <fid>|status|log}');
+        process.exit(1);
+    }
+  } catch(e) {
+    logError(`未捕获异常: ${e.message}\n${e.stack}`);
+    process.exit(1);
+  }
+})();

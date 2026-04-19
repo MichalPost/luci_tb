@@ -1,0 +1,61 @@
+#!/bin/sh /etc/rc.common
+# /etc/init.d/tieba-sign
+
+START=99
+STOP=10
+USE_PROCD=1
+
+CRON_TAG="# tieba-sign"
+CRON_FILE="/etc/crontabs/root"
+WORK_DIR="/tmp/tieba-sign"
+
+start_service() {
+    mkdir -p "$WORK_DIR"
+    update_cron
+}
+
+stop_service() {
+    remove_cron
+}
+
+reload_service() {
+    update_cron
+    /etc/init.d/cron restart 2>/dev/null || true
+}
+
+service_triggers() {
+    procd_add_reload_trigger "tieba-sign"
+}
+
+update_cron() {
+    local enabled cron_hour cron_minute old_line new_line
+    enabled="$(uci -q get tieba-sign.main.enabled)"
+    cron_hour="$(uci -q get tieba-sign.main.cron_hour)"
+    cron_minute="$(uci -q get tieba-sign.main.cron_minute)"
+
+    old_line=""
+    [ -f "$CRON_FILE" ] && old_line="$(grep -F "$CRON_TAG" "$CRON_FILE" 2>/dev/null | head -n1 || true)"
+
+    remove_cron
+
+    if [ "$enabled" = "1" ] && [ -n "$cron_hour" ]; then
+        local cron_min="${cron_minute:-0}"
+        new_line="$cron_min $cron_hour * * * /usr/bin/tieba-sign run $CRON_TAG"
+        echo "$new_line" >> "$CRON_FILE"
+        if [ "$old_line" != "$new_line" ]; then
+            /etc/init.d/cron restart 2>/dev/null || true
+            logger -t tieba-sign "cron updated: $new_line"
+        fi
+    else
+        if [ -n "$old_line" ]; then
+            /etc/init.d/cron restart 2>/dev/null || true
+            logger -t tieba-sign "cron entry removed (disabled or no hour)"
+        fi
+    fi
+}
+
+remove_cron() {
+    if [ -f "$CRON_FILE" ]; then
+        sed -i "/$CRON_TAG/d" "$CRON_FILE"
+    fi
+}

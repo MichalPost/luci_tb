@@ -1,0 +1,24 @@
+{
+    "admin/services/tieba-sign": {
+        "title": "贴吧签到",
+        "order": 60,
+        "action": {
+            "type": "view",
+            "path": "tieba-sign/main"
+        },
+        "depends": {
+            "acl": [ "luci-app-tieba-sign" ]
+        }
+    },
+    "admin/services/tieba-sign/about": {
+        "title": "贴吧签到 · 说明",
+        "order": 61,
+        "action": {
+            "type": "view",
+            "path": "tieba-sign/about"
+        },
+        "depends": {
+            "acl": [ "luci-app-tieba-sign" ]
+        }
+    }
+}
